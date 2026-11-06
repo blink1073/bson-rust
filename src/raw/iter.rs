@@ -1,20 +1,39 @@
-use std::{convert::TryInto, marker::PhantomData};
+use std::convert::TryInto;
 
 use crate::{
     Bson,
+    DateTime,
+    Decimal128,
     RawBson,
+    Timestamp,
+    oid::ObjectId,
     raw::{
         CStr,
         Error,
         MIN_BSON_DOCUMENT_SIZE,
+        MIN_CODE_WITH_SCOPE_SIZE,
         Result,
+        bool_from_slice,
+        cstring_bytes,
+        f64_from_slice,
         read_cstring_with_max_len,
+        read_lenencode_bytes,
+        try_to_str,
         value::RawValue,
     },
     spec::ElementType,
 };
 
-use super::{RawBsonRef, RawDocument, checked_add, i32_from_slice, read_len};
+use super::{
+    RawArray,
+    RawBinaryRef,
+    RawBsonRef,
+    RawDocument,
+    checked_add,
+    i32_from_slice,
+    i64_from_slice,
+    read_len,
+};
 
 /// An iterator over the key-value pairs in a document. Construct by calling [`RawDocument::iter`]
 /// or [`RawDocumentBuf::iter`](crate::RawDocumentBuf::iter).
@@ -372,13 +391,101 @@ impl<'a> From<Utf8LossyBson<'a>> for RawBson {
 /// lengths, null terminators, and bounds). It does not perform any UTF-8 validation; keys and
 /// string-like values are exposed as raw bytes so that the caller can decide how to decode them.
 /// An error is returned and iteration ends if an element cannot be located.
+///
+/// Iteration ends cleanly (i.e. [`Iterator::next`] returns `None`) only when the terminating null
+/// byte is reached as the final byte of the document. Any byte of the document's body that is not
+/// consumed by an element (including a premature null type tag) produces an error, so a completed
+/// iteration accounts for the entire document.
 pub struct RawElementViewIter<'a> {
-    _marker: PhantomData<&'a [u8]>,
+    bytes: &'a [u8],
+    offset: usize,
+    /// Whether the underlying doc is assumed to be valid or if an error has been encountered.
+    /// After an error, all subsequent iterations will return None.
+    valid: bool,
 }
 
 impl<'a> RawElementViewIter<'a> {
-    pub(crate) fn new(_doc: &'a RawDocument) -> Self {
-        todo!()
+    pub(crate) fn new(doc: &'a RawDocument) -> Self {
+        Self {
+            bytes: doc.as_bytes(),
+            offset: 4,
+            valid: true,
+        }
+    }
+
+    fn verify_enough_bytes(&self, start: usize, num_bytes: usize) -> Result<()> {
+        let end = checked_add(start, num_bytes)?;
+        if self.bytes.get(start..end).is_none() {
+            return Err(Error::malformed_bytes(format!(
+                "length exceeds remaining length of buffer: {} vs {}",
+                num_bytes,
+                self.bytes.len() - start
+            )));
+        }
+        Ok(())
+    }
+
+    fn get_next_length_at(&self, start_at: usize) -> Result<usize> {
+        let len = i32_from_slice(&self.bytes[start_at..])?;
+        if len < 0 {
+            Err(Error::malformed_bytes("lengths can't be negative"))
+        } else {
+            Ok(len as usize)
+        }
+    }
+
+    fn next_document_len(&self, starting_at: usize) -> Result<usize> {
+        self.verify_enough_bytes(starting_at, MIN_BSON_DOCUMENT_SIZE as usize)?;
+        let size = i32_from_slice(&self.bytes[starting_at..])? as usize;
+
+        if size < MIN_BSON_DOCUMENT_SIZE as usize {
+            return Err(Error::malformed_bytes(format!(
+                "document too small: {} bytes",
+                size
+            )));
+        }
+
+        self.verify_enough_bytes(starting_at, size)?;
+
+        if self.bytes[starting_at + size - 1] != 0 {
+            return Err(Error::malformed_bytes("not null terminated"));
+        }
+        Ok(size)
+    }
+
+    /// Calculates the size of the value of an element of `element_type` whose value begins at
+    /// `offset`, performing only the structural validation needed to locate the element's extent
+    /// (lengths, null terminators, and bounds). No UTF-8 validation is performed.
+    fn value_size_at(&self, offset: usize, element_type: ElementType) -> Result<usize> {
+        let size = match element_type {
+            ElementType::Boolean => 1,
+            ElementType::Int32 => 4,
+            ElementType::Int64 => 8,
+            ElementType::Double => 8,
+            ElementType::DateTime => 8,
+            ElementType::Timestamp => 8,
+            ElementType::ObjectId => 12,
+            ElementType::Decimal128 => 16,
+            ElementType::Null => 0,
+            ElementType::Undefined => 0,
+            ElementType::MinKey => 0,
+            ElementType::MaxKey => 0,
+            ElementType::String | ElementType::Symbol | ElementType::JavaScriptCode => {
+                read_len(&self.bytes[offset..])?
+            }
+            ElementType::EmbeddedDocument | ElementType::Array => self.next_document_len(offset)?,
+            ElementType::Binary => self.get_next_length_at(offset)? + 4 + 1,
+            ElementType::RegularExpression => {
+                let pattern = cstring_bytes(&self.bytes[offset..])?;
+                let options = cstring_bytes(&self.bytes[offset + pattern.len() + 1..])?;
+                pattern.len() + 1 + options.len() + 1
+            }
+            ElementType::DbPointer => read_len(&self.bytes[offset..])? + 12,
+            ElementType::JavaScriptCodeWithScope => self.get_next_length_at(offset)?,
+        };
+
+        self.verify_enough_bytes(offset, size)?;
+        Ok(size)
     }
 }
 
@@ -386,7 +493,61 @@ impl<'a> Iterator for RawElementViewIter<'a> {
     type Item = Result<RawElementView<'a>>;
 
     fn next(&mut self) -> Option<Result<RawElementView<'a>>> {
-        todo!()
+        if !self.valid {
+            return None;
+        } else if self.offset >= self.bytes.len() {
+            self.valid = false;
+            return Some(Err(Error::malformed_bytes("iteration overflowed document")));
+        } else if self.offset == self.bytes.len() - 1 {
+            return if self.bytes[self.offset] == 0 {
+                None
+            } else {
+                self.valid = false;
+                Some(Err(Error::malformed_bytes("document not null terminated")))
+            };
+        }
+
+        let element_type = match ElementType::from(self.bytes[self.offset]) {
+            Some(et) => et,
+            None => {
+                self.valid = false;
+                return Some(Err(Error::malformed_bytes(format!(
+                    "invalid tag: {} (at byte offset {})",
+                    self.bytes[self.offset], self.offset
+                ))));
+            }
+        };
+
+        // Locate the key's null terminator without validating it as UTF-8.
+        let key_start = self.offset + 1;
+        let key_len = match self.bytes[key_start..].iter().position(|&b| b == 0) {
+            Some(len) => len,
+            None => {
+                self.valid = false;
+                return Some(Err(Error::malformed_bytes(format!(
+                    "expected null terminator for key (at byte offset {})",
+                    key_start
+                ))));
+            }
+        };
+        let key = &self.bytes[key_start..key_start + key_len];
+        let value_offset = key_start + key_len + 1;
+
+        Some(match self.value_size_at(value_offset, element_type) {
+            Ok(size) => {
+                self.offset = value_offset + size;
+                Ok(RawElementView {
+                    element_type,
+                    key,
+                    value: &self.bytes[value_offset..value_offset + size],
+                    value_offset,
+                })
+            }
+            Err(error) => {
+                self.valid = false;
+                Err(error)
+            }
+        })
     }
 }
 
@@ -394,13 +555,36 @@ impl<'a> Iterator for RawElementViewIter<'a> {
 /// [`RawDocumentBuf`](crate::RawDocumentBuf), yielded by [`RawElementViewIter`]. Neither the key
 /// nor the value has been validated as UTF-8.
 ///
-/// Call [`RawElementView::value`] to parse the value, or convert the view into a [`RawElement`]
-/// via its `TryFrom` implementation to validate the key.
-#[derive(Clone)]
+/// Call [`RawElementView::value`] to parse the value (validating all strings as UTF-8), call
+/// [`RawElementView::value_view`] to parse the value's shape while leaving string-like payloads as
+/// raw bytes, or convert the view into a [`RawElement`] via its `TryFrom` implementation to
+/// validate the key.
+///
+/// ```
+/// # use bson::raw::{RawBsonRefView, RawDocument};
+/// // a document whose string value contains invalid UTF-8
+/// let doc = RawDocument::from_bytes(b"\x12\0\0\0\x02a\0\x06\0\0\0h\xffllo\0\0")?;
+///
+/// let mut decoded = Vec::new();
+/// for element in doc.iter_element_views() {
+///     let element = element?;
+///     match element.value_view()? {
+///         RawBsonRefView::String(payload) => {
+///             // the caller applies its own decoding policy; the framing has been parsed
+///             decoded.push((element.key_bytes().to_vec(), payload.to_vec()));
+///         }
+///         _ => unreachable!(),
+///     }
+/// }
+/// assert_eq!(decoded, [(b"a".to_vec(), b"h\xffllo".to_vec())]);
+/// # Ok::<(), bson::error::Error>(())
+/// ```
+#[derive(Clone, Debug)]
 pub struct RawElementView<'a> {
     element_type: ElementType,
     key: &'a [u8],
     value: &'a [u8],
+    value_offset: usize,
 }
 
 impl<'a> RawElementView<'a> {
@@ -426,7 +610,79 @@ impl<'a> RawElementView<'a> {
     /// bytes are invalid, including if any strings in the value are not valid UTF-8. The key is
     /// not validated.
     pub fn value(&self) -> Result<RawBsonRef<'a>> {
-        todo!()
+        RawValue::new_at(self.element_type, self.value, self.value_offset).parse()
+    }
+
+    /// Parses the shape of this element's value into a [`RawBsonRefView`], in which the payloads
+    /// of string-like types ([`ElementType::String`], [`ElementType::Symbol`],
+    /// [`ElementType::JavaScriptCode`], [`ElementType::JavaScriptCodeWithScope`],
+    /// [`ElementType::DbPointer`], and [`ElementType::RegularExpression`]) are exposed as raw
+    /// bytes, leaving the caller to apply its own decoding policy. All type-specific framing
+    /// (length prefixes, null terminators, and nested extents) is parsed, and an error is returned
+    /// if the underlying bytes are structurally invalid. The key is not validated, and no part of
+    /// the value is validated as UTF-8.
+    pub fn value_view(&self) -> Result<RawBsonRefView<'a>> {
+        Ok(match self.element_type {
+            ElementType::Null => RawBsonRefView::Null,
+            ElementType::Undefined => RawBsonRefView::Undefined,
+            ElementType::MinKey => RawBsonRefView::MinKey,
+            ElementType::MaxKey => RawBsonRefView::MaxKey,
+            ElementType::ObjectId => RawBsonRefView::ObjectId(ObjectId::parse(self.value)?),
+            ElementType::Int32 => RawBsonRefView::Int32(i32_from_slice(self.value)?),
+            ElementType::Int64 => RawBsonRefView::Int64(i64_from_slice(self.value)?),
+            ElementType::Double => RawBsonRefView::Double(f64_from_slice(self.value)?),
+            ElementType::Boolean => RawBsonRefView::Boolean(
+                bool_from_slice(self.value).map_err(Error::malformed_bytes)?,
+            ),
+            ElementType::DateTime => RawBsonRefView::DateTime(DateTime::parse(self.value)?),
+            ElementType::Decimal128 => RawBsonRefView::Decimal128(Decimal128::parse(self.value)?),
+            ElementType::Timestamp => RawBsonRefView::Timestamp(Timestamp::parse(self.value)?),
+            ElementType::Binary => RawBsonRefView::Binary(RawBinaryRef::parse(self.value)?),
+            ElementType::String => RawBsonRefView::String(read_lenencode_bytes(self.value)?),
+            ElementType::Symbol => RawBsonRefView::Symbol(read_lenencode_bytes(self.value)?),
+            ElementType::JavaScriptCode => {
+                RawBsonRefView::JavaScriptCode(read_lenencode_bytes(self.value)?)
+            }
+            ElementType::EmbeddedDocument => {
+                RawBsonRefView::Document(RawDocument::from_bytes(self.value)?)
+            }
+            ElementType::Array => {
+                RawBsonRefView::Array(RawArray::from_doc(RawDocument::from_bytes(self.value)?))
+            }
+            ElementType::RegularExpression => {
+                let pattern = cstring_bytes(self.value)?;
+                let options = cstring_bytes(&self.value[pattern.len() + 1..])?;
+                RawBsonRefView::RegularExpression { pattern, options }
+            }
+            ElementType::DbPointer => {
+                let namespace = read_lenencode_bytes(self.value)?;
+                if self.value.len() < 12 {
+                    return Err(Error::malformed_bytes("dbpointer too short"));
+                }
+                let id = ObjectId::from_bytes(
+                    self.value[self.value.len() - 12..]
+                        .try_into()
+                        .map_err(Error::malformed_bytes)?,
+                );
+                RawBsonRefView::DbPointer { namespace, id }
+            }
+            ElementType::JavaScriptCodeWithScope => {
+                if self.value.len() < MIN_CODE_WITH_SCOPE_SIZE as usize {
+                    return Err(Error::malformed_bytes("code with scope length too small"));
+                }
+
+                let code = read_lenencode_bytes(&self.value[4..])?;
+                // the scope follows the code's raw bytes; using the encoded length here would
+                // shift the offset whenever the code contains multi-byte sequences
+                let scope_start = 4 + 4 + code.len() + 1;
+                if scope_start >= self.value.len() {
+                    return Err(Error::malformed_bytes("code with scope length overrun"));
+                }
+                let scope = RawDocument::from_bytes(&self.value[scope_start..])?;
+
+                RawBsonRefView::JavaScriptCodeWithScope { code, scope }
+            }
+        })
     }
 }
 
@@ -435,7 +691,126 @@ impl<'a> TryFrom<RawElementView<'a>> for RawElement<'a> {
 
     /// Validates the view's key and converts it into a [`RawElement`]. Returns an error if the key
     /// is not valid UTF-8.
-    fn try_from(_view: RawElementView<'a>) -> Result<Self> {
-        todo!()
+    fn try_from(view: RawElementView<'a>) -> Result<Self> {
+        let key: &CStr = try_to_str(view.key)?.try_into()?;
+        Ok(Self {
+            key,
+            value: RawValue::new_at(view.element_type, view.value, view.value_offset),
+        })
+    }
+}
+
+/// A parsed view of a BSON value in which the payloads of string-like types are exposed as raw
+/// bytes, leaving the caller to apply its own decoding policy. This is the byte-preserving analog
+/// of [`RawBsonRef`]: all other variants are identical, and all type-specific framing has been
+/// parsed and validated. Construct by calling [`RawElementView::value_view`].
+///
+/// Bytes are borrowed from the source document and are not guaranteed to be valid UTF-8.
+#[derive(Clone, PartialEq)]
+pub enum RawBsonRefView<'a> {
+    /// 64-bit binary floating point
+    Double(f64),
+    /// UTF-8 string, as raw bytes excluding the length prefix and null terminator
+    String(&'a [u8]),
+    /// Array
+    Array(&'a RawArray),
+    /// Embedded document
+    Document(&'a RawDocument),
+    /// Boolean value
+    Boolean(bool),
+    /// Null value
+    Null,
+    /// Regular expression, with the pattern and options as raw bytes excluding their null
+    /// terminators
+    RegularExpression {
+        /// The pattern bytes
+        pattern: &'a [u8],
+        /// The options bytes
+        options: &'a [u8],
+    },
+    /// JavaScript code, as raw bytes excluding the length prefix and null terminator
+    JavaScriptCode(&'a [u8]),
+    /// JavaScript code w/ scope, with the code as raw bytes excluding the length prefix and null
+    /// terminator, and the scope document validated for structural validity only
+    JavaScriptCodeWithScope {
+        /// The code bytes
+        code: &'a [u8],
+        /// The scope document
+        scope: &'a RawDocument,
+    },
+    /// 32-bit signed integer
+    Int32(i32),
+    /// 64-bit signed integer
+    Int64(i64),
+    /// Timestamp
+    Timestamp(Timestamp),
+    /// Binary data
+    Binary(RawBinaryRef<'a>),
+    /// [ObjectId](http://dochub.mongodb.org/core/objectids)
+    ObjectId(ObjectId),
+    /// UTC datetime
+    DateTime(DateTime),
+    /// [128-bit decimal](https://github.com/mongodb/specifications/blob/master/source/bson-decimal128/decimal128.md)
+    Decimal128(Decimal128),
+    /// [DBPointer](https://bsonspec.org/spec.html), with the namespace as raw bytes excluding the
+    /// length prefix and null terminator
+    DbPointer {
+        /// The namespace bytes
+        namespace: &'a [u8],
+        /// The referenced id
+        id: ObjectId,
+    },
+    /// Deprecated UTF-8 string type, as raw bytes excluding the length prefix and null terminator
+    Symbol(&'a [u8]),
+    /// Deprecated value
+    Undefined,
+    /// Max key
+    MaxKey,
+    /// Min key
+    MinKey,
+}
+
+impl std::fmt::Debug for RawBsonRefView<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // string-like payloads are rendered lossily for diagnostic purposes
+        fn bytes(bytes: &[u8]) -> std::borrow::Cow<'_, str> {
+            String::from_utf8_lossy(bytes)
+        }
+
+        match self {
+            Self::Double(v) => f.debug_tuple("Double").field(v).finish(),
+            Self::String(b) => f.debug_tuple("String").field(&bytes(b)).finish(),
+            Self::Array(a) => f.debug_tuple("Array").field(a).finish(),
+            Self::Document(d) => f.debug_tuple("Document").field(d).finish(),
+            Self::Boolean(v) => f.debug_tuple("Boolean").field(v).finish(),
+            Self::Null => f.write_str("Null"),
+            Self::RegularExpression { pattern, options } => f
+                .debug_struct("RegularExpression")
+                .field("pattern", &bytes(pattern))
+                .field("options", &bytes(options))
+                .finish(),
+            Self::JavaScriptCode(c) => f.debug_tuple("JavaScriptCode").field(&bytes(c)).finish(),
+            Self::JavaScriptCodeWithScope { code, scope } => f
+                .debug_struct("JavaScriptCodeWithScope")
+                .field("code", &bytes(code))
+                .field("scope", scope)
+                .finish(),
+            Self::Int32(v) => f.debug_tuple("Int32").field(v).finish(),
+            Self::Int64(v) => f.debug_tuple("Int64").field(v).finish(),
+            Self::Timestamp(v) => f.debug_tuple("Timestamp").field(v).finish(),
+            Self::Binary(v) => f.debug_tuple("Binary").field(v).finish(),
+            Self::ObjectId(v) => f.debug_tuple("ObjectId").field(v).finish(),
+            Self::DateTime(v) => f.debug_tuple("DateTime").field(v).finish(),
+            Self::Decimal128(v) => f.debug_tuple("Decimal128").field(v).finish(),
+            Self::DbPointer { namespace, id } => f
+                .debug_struct("DbPointer")
+                .field("namespace", &bytes(namespace))
+                .field("id", id)
+                .finish(),
+            Self::Symbol(b) => f.debug_tuple("Symbol").field(&bytes(b)).finish(),
+            Self::Undefined => f.write_str("Undefined"),
+            Self::MaxKey => f.write_str("MaxKey"),
+            Self::MinKey => f.write_str("MinKey"),
+        }
     }
 }
